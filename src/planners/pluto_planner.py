@@ -38,7 +38,7 @@ from .ml_planner_utils import global_trajectory_to_states, load_checkpoint
 
 class PlutoPlanner(AbstractPlanner):
     requires_scenario: bool = True
-
+    index = 0
     def __init__(
         self,
         planner: TorchModuleWrapper,
@@ -261,6 +261,10 @@ class PlutoPlanner(AbstractPlanner):
                     return_img=True,
                 )
             )
+            import cv2
+            index = self.index +1
+            self.index = index
+            cv2.imwrite(f"/home/dxw/jobcode/mos1.2/app/maxieye/e2e/pluto/nuplan/exp/output_{index}.png", self._imgs[-1])
 
         return trajectory
 
@@ -274,6 +278,7 @@ class PlutoPlanner(AbstractPlanner):
         """
         candidate_trajectories: (n_ref, n_mode, 80, 3)
         probability: (n_ref, n_mode)
+        按照概率排序，取前k个，并将概率转换为softmax，取前20个，并且由自车坐标系转到全局坐标系
         """
         if len(candidate_trajectories.shape) == 4:
             n_ref, n_mode, T, C = candidate_trajectories.shape
@@ -298,6 +303,8 @@ class PlutoPlanner(AbstractPlanner):
         rot_mat = np.array(
             [[np.cos(angle), np.sin(angle)], [-np.sin(angle), np.cos(angle)]]
         )
+        # Tw_b2 =Tw_b1*Tb1_b2
+        # tw_b2= Rw_b1*tb1_b2 + tw_b1
         sorted_candidate_trajectories[..., :2] = (
             np.matmul(sorted_candidate_trajectories[..., :2], rot_mat) + origin
         )
@@ -399,6 +406,8 @@ class PlutoPlanner(AbstractPlanner):
         return np.concatenate([position, heading[..., None]], axis=-1)
 
     def _global_to_local(self, global_trajectory: np.ndarray, ego_state: EgoState):
+        # 以自车后轴为原点，车头方向为 x 轴，左侧为y轴
+        
         if isinstance(global_trajectory, InterpolatedTrajectory):
             states: List[EgoState] = global_trajectory.get_sampled_trajectory()
             global_trajectory = np.stack(
@@ -410,12 +419,14 @@ class PlutoPlanner(AbstractPlanner):
                 ],
                 axis=0,
             )
-
+        # Tw_b1 Tw_b2
+        # Tb1_b2 = Tw_b2^-1 * Tw_b1
         origin = ego_state.rear_axle.array
         angle = ego_state.rear_axle.heading
         rot_mat = np.array(
             [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
         )
+        # 此处可以推导下，tb1_b2 = R.T (tw_b1 - tw_b2)
         position = np.matmul(global_trajectory[..., :2] - origin, rot_mat)
         heading = global_trajectory[..., 2] - angle
 

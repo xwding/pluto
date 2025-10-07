@@ -125,10 +125,24 @@ class PlanningModel(TorchModuleWrapper):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
     def forward(self, data):
+        # 所有体（包含ego在内，ego在第0个索引）的“当前时刻”位置，已做自车坐标归一化。
+        # 自车坐标系：原点为当前时刻的自车后轴中心，x 向前，y 向左；单位为米。
+        # 形状： (bs, A, 2) A:智能体的数量   2：平面坐标 (x, y)
+        #  data["agent"]["position"] (B,A,T,2)  T:时间步数        
         agent_pos = data["agent"]["position"][:, :, self.history_steps - 1]
         agent_heading = data["agent"]["heading"][:, :, self.history_steps - 1]
         agent_mask = data["agent"]["valid_mask"][:, :, : self.history_steps]
+        # 每个多边形地图元素（车道、车道连接、斑马线）的“中心点”及其朝向：
+        # [x, y, yaw]，其中 (x, y) 为该多边形在自车坐标系下的中心位置（通常取中心线中点），yaw 为该处的切向朝向。
+        # 单位：米、弧度；同样已做自车坐标归一化（减去自车位姿并旋转到自车坐标系）。
+        # 形状： (bs, M, 3)
+        # M：批内 padding 后的多边形数量
         polygon_center = data["map"]["polygon_center"]
+        # 含义：针对每个多边形在其采样的多段离散点（默认每条 20 个点）的有效性掩码。
+        # True 表示该段采样点在 [-radius, radius]×[-radius, radius] 的兴趣区域内。
+        # 形状： (bs, M, P)
+        # P：每个多边形的采样点数（默认 20）
+        # 用途：模型里通过 any(-1) 得到 (bs, M) 的多边形级 key padding（整条多边形若无有效点，则作为 padding 屏蔽）。
         polygon_mask = data["map"]["valid_mask"]
 
         bs, A = agent_pos.shape[0:2]
@@ -221,7 +235,7 @@ class PlanningModel(TorchModuleWrapper):
                 ]
 
                 out["output_trajectory"] = best_trajectory
-                out["candidate_trajectories"] = out_trajectory
+                out["candidate_trajectories"] = out_trajectory# 形状 (bs, R, M, T, 3)
             else:
                 out["output_trajectory"] = out["output_ref_free_trajectory"]
                 out["probability"] = torch.zeros(1, 0, 0)

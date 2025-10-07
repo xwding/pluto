@@ -100,9 +100,29 @@ class NuplanScenarioRender:
         candidate_index=None,
         return_img=True,
     ):
+        """
+        Args:
+            current_input (PlannerInput, optional): 当前仿真输入，包含历史 ego 状态和观测.
+            initialization (PlannerInitialization, optional): 场景初始化信息.
+            route_roadblock_ids (List[str], optional): 路线约束的 roadblock id 列表.
+            scenario (_type_, optional): 可选的场景对象，用于获取“真值”(ground-truth) ego 轨迹与状态作对比可视化.
+            iteration (_type_, optional): 当前迭代/帧的索引，用来从 scenario 中取对应时刻的 GT.
+            planning_trajectory (_type_, optional): 最终选中的规划轨迹，用于高亮显示。.
+            candidate_trajectories (_type_, optional): 候选轨迹集合 得分超过0的所有候选轨迹.  
+                                                形状： K*T*3。K 为候选条数,T 为时间步数（常见 80/81
+                                                显示样式：灰色细线，终点打灰色散点
+            predictions (_type_, optional): 对其他交通参与者未来位置的预测 N_agents*T*3 绘制时常见只用前 40 帧
+            rollout_trajectories (_type_, optional): _description_. Defaults to None.
+            agent_attn_weights (_type_, optional): 可选的注意力权重，用于在目标框旁标注数值，辅助解释模型关注点.
+            candidate_index (_type_, optional): _description_. Defaults to None.
+            return_img (bool, optional): _description_. Defaults to True.
+        """
+        #当前 ego 状态 EgoState（全局坐标）。
         ego_state = current_input.history.ego_states[-1]
         map_api = initialization.map_api
+        # 当前帧 TrackedObjects（全局坐标）。
         tracked_objects = current_input.history.observations[-1]
+        # 当前帧路口信号灯状态。
         traffic_light_status = current_input.traffic_light_data
         mission_goal = initialization.mission_goal
         if route_roadblock_ids is None:
@@ -196,9 +216,10 @@ class NuplanScenarioRender:
         return_img=False,
     ):
         fig, ax = plt.subplots(figsize=(10, 10))
-
+        #自车历史轨迹  全局坐标系
         self._history_trajectory.append(ego_state.rear_axle.array)
         if gt_state is not None:
+            # 专家（真值）历史轨迹的全局坐标点序列（后轴中心）
             self._expert_history_trajectory.append(gt_state.rear_axle.array)
 
         if self.scenario_manager is None:
@@ -209,11 +230,14 @@ class NuplanScenarioRender:
             self.need_update = True
 
         if self.need_update:
+            # 更新自车状态、可行驶区域栅格/多边形、以及基于当前状态的参考路径等
             self.scenario_manager.update_ego_state(ego_state)
             self.scenario_manager.update_drivable_area_map()
             self.scenario_manager.update_ego_path()
-
+        # 当前自车后轴中心的全局位置向量 [x, y]
         self.origin = ego_state.rear_axle.array
+        # 当前自车后轴航向角（弧度）
+        # 后续绘制都需要转到自车坐标系。
         self.angle = ego_state.rear_axle.heading
         self.rot_mat = np.array(
             [
@@ -222,7 +246,11 @@ class NuplanScenarioRender:
             ],
             dtype=np.float64,
         )
-
+        # map_api：地图接口，用于查询近邻道路元素（车道、连接段、人行横道等）。
+        # ego_state.center.point：以自车几何中心作为查询点，限定绘制范围。
+        # traffic_light_status：当前帧的交通灯状态，用于上色中心线/停止线等。
+        # route_roadblock_ids：路线约束集合，用以高亮“在路线内”的路段。
+        # 效果：绘出道路多边形、中心线（带灯控状态的样式）、人行横道等，并已转换到自车局部坐标显示。
         self._plot_map(
             ax,
             map_api,
@@ -231,17 +259,19 @@ class NuplanScenarioRender:
             set(route_roadblock_ids),
         )
 
+        # 沿参考线稀疏点绘制洋红色箭头，表示道路前进方向（在局部坐标中显示
         self._plot_reference_lines(ax, self.scenario_manager.get_reference_lines())
-
+        # 橙色描边矩形，无填充
         self._plot_ego(ax, ego_state)
 
         if gt_state is not None:
+            # gt 自车轮廓以半透明灰色显示。
             self._plot_ego(ax, gt_state, gt=True)
             gt_trajectory = np.array([state.rear_axle.array for state in gt_trajectory])
             gt_trajectory = np.matmul(gt_trajectory - self.origin, self.rot_mat)
             ax.plot(gt_trajectory[:, 0], gt_trajectory[:, 1], color="blue", alpha=0.5)
 
-        if not self.disable_agent:
+        if not self.disable_agent:  
             for track in tracked_objects.tracked_objects:
                 self._plot_tracked_object(ax, track, agent_attn_weights)
 
@@ -413,7 +443,9 @@ class NuplanScenarioRender:
         )
 
     def _plot_candidate_trajectories(self, ax, candidate_trajectories: np.ndarray):
+        
         for traj in candidate_trajectories:
+            # 将整条轨迹以灰色折线绘制出来
             ax.plot(
                 traj[:, 0],
                 traj[:, 1],
@@ -422,6 +454,7 @@ class NuplanScenarioRender:
                 zorder=5,
                 linewidth=2,
             )
+            # 在该轨迹的终点处绘制一个灰色散点，用于强调终点位置
             ax.scatter(traj[-1, 0], traj[-1, 1], color="gray", zorder=5, s=10)
 
     def _plot_rollout_trajectories(self, ax, candidate_trajectories: np.ndarray):

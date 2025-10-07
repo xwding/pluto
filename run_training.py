@@ -14,6 +14,8 @@ from nuplan.planning.script.utils import set_default_path
 from nuplan.planning.training.experiments.caching import cache_data
 from omegaconf import DictConfig
 
+import sys
+
 from src.custom_training import (
     TrainingEngine,
     build_training_engine,
@@ -107,3 +109,4 @@ def main(cfg: DictConfig) -> Optional[TrainingEngine]:
 
 if __name__ == "__main__":
     main()
+# \\wsl.localhost\Ubuntu-20.04\home\dxw\jobcode\mos1.2\app\maxieye\e2e\nuplan\nuplan-v1.1_mini\data\cache\mini

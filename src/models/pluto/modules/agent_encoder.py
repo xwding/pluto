@@ -40,11 +40,15 @@ class AgentEncoder(nn.Module):
 
     @staticmethod
     def to_vector(feat, valid_mask):
+        # feat: [bs, A, T, C]
+        # valid_mask: [bs, A, T]
+        # output: [bs, A, T-1, C]
+        # 只有当相邻两个时间步都为 True 时，该位置才为 True。
         vec_mask = valid_mask[..., :-1] & valid_mask[..., 1:]
 
         while len(vec_mask.shape) < len(feat.shape):
             vec_mask = vec_mask.unsqueeze(-1)
-
+        # [bs, A, T, C] --> [bs, A, T-1, C]
         return torch.where(
             vec_mask,
             feat[:, :, 1:, ...] - feat[:, :, :-1, ...],
@@ -57,8 +61,15 @@ class AgentEncoder(nn.Module):
         position = data["agent"]["position"][:, :, :T]
         heading = data["agent"]["heading"][:, :, :T]
         velocity = data["agent"]["velocity"][:, :, :T]
+        # 各体在历史T帧内的几何尺寸，顺序为 [width, length]。
+        # 单位：米。
+        # 形状：(bs, A, T, 2)
         shape = data["agent"]["shape"][:, :, :T]
+        # 体类别索引，用于类型嵌入。映射顺序与特征构建保持一致：[EGO, VEHICLE, PEDESTRIAN, BICYCLE] → [0,1,2,3]。
+        # 形状：(bs, A)
         category = data["agent"]["category"].long()
+        # 逐帧有效性掩码。True 表示该体在该帧存在且数值有效；False 表示缺失/不可用。
+        # 形状：(bs, A, T)
         valid_mask = data["agent"]["valid_mask"][:, :, :T]
 
         heading_vec = self.to_vector(heading, valid_mask)
@@ -75,6 +86,9 @@ class AgentEncoder(nn.Module):
         )
         bs, A, T, _ = agent_feature.shape
         agent_feature = agent_feature.view(bs * A, T, -1)
+        # any(-1) 会在时间维上求“是否存在任意一个为 True”，得到形状 [B, A] 的布尔张量，
+        # 表示“该体在整个时间序列中是否至少有一帧有效”。
+        # 随后 flatten() 将其拉平成 [BA]，与上文把特征 view 为 [BA, ...] 的做法对齐，
         valid_agent_mask = valid_mask.any(-1).flatten()
 
         x_agent_tmp = self.history_encoder(

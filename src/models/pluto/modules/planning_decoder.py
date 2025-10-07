@@ -133,12 +133,31 @@ class PlanningDecoder(nn.Module):
         nn.init.normal_(self.m_pos, mean=0.0, std=0.01)
 
     def forward(self, data, enc_data):
+        # B: batch size
+        # R: 每个样本的参考线（候选路线）数量
+        # P: 每条参考线被采样的点数
+        # M: 模态数（num_mode，多模轨迹假设的数量）
+        # D: 特征维度（decoder/encoder的隐藏维度）
+        # Nmem: encoder 输出的“记忆”序列长度（场景/地图/目标的编码 token 数）
+        
+        # 包含已编码的目标、场景、地图等上下文特征。
+        # 形状: (B, Nmem, D)
+        # 用途: 作为 cross-attention 的 K/V；
         enc_emb = enc_data["enc_emb"]
+        # 对 enc_emb 的 padding 掩码. True 表示该位置是 padding，需要在注意力中被忽略。
+        # 形状: (B, Nmem) bool
         enc_key_padding_mask = enc_data["enc_key_padding_mask"]
-
+        # 含义: 每条参考线按纵向采样的 2D 位置序列（通常是地图坐标或自车坐标系下的 x,y）。代码中会减去第一个点的 (x,y)，得到相对位移，增强平移不变性。
+        # 形状: (B, R, P, 2)
         r_position = data["reference_line"]["position"]
+        # 参考线上每个采样点的切向方向向量（dx, dy），通常为单位向量，表示参考线的局部方向。
+        # 形状: (B, R, P, 2)
         r_vector = data["reference_line"]["vector"]
+        # 参考线上每个采样点的朝向（航向角 yaw，弧度制）。代码里会转成 [cos(yaw), sin(yaw)] 以避免角度环形不连续问题。
+        # 形状: (B, R, P)
         r_orientation = data["reference_line"]["orientation"]
+        # 每条参考线每个点是否有效的掩码。True 表示该采样点存在/有效（比如未越界或数据可用）。
+        # 形状: (B, R, P) bool
         r_valid_mask = data["reference_line"]["valid_mask"]
         r_key_padding_mask = ~r_valid_mask.any(-1)
 
@@ -159,9 +178,13 @@ class PlanningDecoder(nn.Module):
         r_pos = torch.cat([r_position[:, :, 0], r_orientation[:, :, 0, None]], dim=-1)
         r_emb = r_emb + self.r_pos_emb(r_pos)
 
+        # 每条参考线聚合后的特征。由参考线点云特征通过 PointsEncoder 编码得到，并叠加了参考线起点位置与朝向的 Fourier 位置编码，
+        # 表示“这条路线”的语义与几何。 初始: (B, R, D) -->  (B, R, M, D)
         r_emb = r_emb.unsqueeze(2).repeat(1, 1, self.num_mode, 1)
+        # 可学习的“模态 token”，为每个模态提供不同的先验/身份标识，使同一条参考线在不同模态下能产生不同的解码查询，从而支持多模轨迹。
+        # 原始参数形状: (1, 1, M, D) -> (B, R, M, D)
         m_emb = self.m_emb.repeat(bs, R, 1, 1)
-
+        # self.q_proj (B, R, M, 2D) --> (B, R, M, D)
         q = self.q_proj(torch.cat([r_emb, m_emb], dim=-1))
 
         for blk in self.decoder_blocks:
@@ -177,10 +200,27 @@ class PlanningDecoder(nn.Module):
         if self.cat_x:
             x = enc_emb[:, 0].unsqueeze(1).unsqueeze(2).repeat(1, R, self.num_mode, 1)
             q = self.cat_x_proj(torch.cat([q, x], dim=-1))
+        # B: batch size
+        # R: 每个样本的参考线（候选路线）数
+        # M: 模态数（num_mode，多模轨迹假设的数量）
+        # T: future_steps（未来时间步数）
+        # D: 隐藏维度
 
+        # 含义: 每个“参考线-模态”的未来位置预测序列。最后一维 2 表示平面坐标 (x, y)。
+        # 坐标系: 与训练标签一致，通常是以参考线起点为原点/朝向对齐的本地坐标系（代码前面构造参考线特征时已做相对化处理）。
+        # 形状: (B, R, M, T, 2)
+        # 单位: 米（常见设定）
         loc = self.loc_head(q).view(bs, R, self.num_mode, self.future_steps, 2)
+        
         yaw = self.yaw_head(q).view(bs, R, self.num_mode, self.future_steps, 2)
+        # 含义: 未来速度向量分量。最后一维 2 表示速度在平面坐标系的两个分量 (vx, vy)。
+        # 坐标系: 与 loc 对齐的同一坐标系（通常是局部参考线坐标系或数据集定义的车体/世界坐标系）。
+        # 形状: (B, R, M, T, 2)
+        # 单位: 米/秒（常见设定）
         vel = self.vel_head(q).view(bs, R, self.num_mode, self.future_steps, 2)
+        # 含义: 混合权重的未归一化分数（logit）。每个“参考线-模态”对应一个标量，用于表征该候选轨迹的置信度/概率。
+        # 形状: (B, R, M)
+        # 用法: 通常在 M 维（每条参考线内）做 softmax 得到各模态概率；有的实现也会在 R×M 维度上统一 softmax 来筛选全局最佳候选。   
         pi = self.pi_head(q).squeeze(-1)
 
         traj = torch.cat([loc, yaw, vel], dim=-1)

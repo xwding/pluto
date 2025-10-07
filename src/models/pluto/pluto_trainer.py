@@ -115,14 +115,33 @@ class LightningTrainer(pl.LightningModule):
         else:
             train_num = bs
 
+        # trajectory: 自车（ego）的规划分支输出轨迹（跨 R 条参考线与 M 个模态的候选）
+        # 形状: (train_num, R, M, T, 6)
+        # 通道: [x, y, cos(yaw), sin(yaw), vx, vy]
+        # 用途: 用于规划回归损失、碰撞损失和分类（选择参考线与模态）
+        
+        #  probability 含义: 每个 (参考线, 模态) 候选轨迹的混合权重分数（logit）
+        # 形状: (train_num, R, M)
+        # 用途: 在 R×M 上做 softmax 或筛选最优候选
+        
+        # prediction 其他交通参与者的预测轨迹
+        # 形状: (train_num, A-1, T, 6)
+        # 用途: 与非自车的监督目标计算预测损失
+        
         trajectory, probability, prediction = (
             res["trajectory"][:train_num],
             res["probability"][:train_num],
             res["prediction"][:train_num],
         )
         ref_free_trajectory = res.get("ref_free_trajectory", None)
-
+        #  所有 agents 的位置与朝向的 GT
+        # 形状: (train_num, A, T, 3)
+        # 通道: [x, y, yaw]（yaw 为弧度）
         targets_pos = data["agent"]["target"][:train_num]
+        # 含义: GT 的有效性掩码，True 表示该 agent 在该时间步有效
+        # 形状: (train_num, A, T)
+        # dtype: bool
+        # 说明: 取最后 T 帧以与预测 horizon 对齐
         valid_mask = data["agent"]["valid_mask"][:train_num, :, -T:]
         targets_vel = data["agent"]["velocity"][:train_num, :, -T:]
 
@@ -199,27 +218,43 @@ class LightningTrainer(pl.LightningModule):
 
     def get_planning_loss(self, data, trajectory, probability, valid_mask, target, bs):
         """
-        trajectory: (bs, R, M, T, 4)
-        valid_mask: (bs, T)
+        trajectory: (bs, R, M, T, 6)
+        含义: 自车在每条参考线、每个模态下的候选未来轨迹。注意函数注释里写的是 4，实际与上游一致为 6（注释已过期）。
+        probability: (bs, R, M)
+        含义: 每个 (参考线, 模态) 候选的分类分数（logit）。
+        valid_mask: (bs, T), dtype: bool
+        含义: 自车未来 T 个时间步的有效性掩码；True 表示该时刻的监督有效。
+        target: (bs, T, 6)
+        含义: 自车的 GT 轨迹，通道与 trajectory 对齐为 [x, y, cos(yaw), sin(yaw), vx, vy]。
         """
         num_valid_points = valid_mask.sum(-1)
         endpoint_index = (num_valid_points / 10).long().clamp_(min=0, max=7)  # max 8s
         r_padding_mask = ~data["reference_line"]["valid_mask"][:bs].any(-1)  # (bs, R)
+        
+        # future_projection (bs, R, 2)
+        # 含义: 在选定的 endpoint_index 时刻，将自车未来状态投影到每条参考线得到的度量。最后维度大小为 2，语义：
+        # future_projection[..., 1]: 用来挑选参考线的“代价/距离”指标（越小越好）。
+        # future_projection[..., 0]: 用来确定模态的连续标量（比如在参考线坐标中的某个投影值）
+        
+        # data["reference_line"]["future_projection"] (bs,R,8,2)
         future_projection = data["reference_line"]["future_projection"][:bs][
             torch.arange(bs), :, endpoint_index
         ]
-
+        # 选择“代价最小”的参考线索引；对无效参考线加上大罚值屏蔽。
         target_r_index = torch.argmin(
             future_projection[..., 1] + 1e6 * r_padding_mask, dim=-1
         )
+        # mode_interval = self.radius / self.num_modes: 标量 含义: 将连续的模态坐标区间 [0, radius) 均分为 M 段的宽度
+        # 将连续模态量（future_projection[..., 0]）量化为离散模态索引，随后 clamp 到 [0, M-1]。
         target_m_index = (
             future_projection[torch.arange(bs), target_r_index, 0] / self.mode_interval
         ).long()
         target_m_index.clamp_(min=0, max=self.num_modes - 1)
-
+        
+        # 参考线×模态的 one-hot 标签，用于分类损失。将 [b, target_r_index[b], target_m_index[b]] 设为 1。
         target_label = torch.zeros_like(probability)
         target_label[torch.arange(bs), target_r_index, target_m_index] = 1
-
+        # 取出每个样本的“最佳”候选轨迹（先选参考线，再选模态）
         best_trajectory = trajectory[torch.arange(bs), target_r_index, target_m_index]
 
         if self.use_collision_loss:
@@ -239,6 +274,12 @@ class LightningTrainer(pl.LightningModule):
         )
 
         if self.regulate_yaw:
+            
+            # 具体来说，best_trajectory[..., 2:4] 取出每个时间步的二维朝向向量 h = [cos(yaw), sin(yaw)]。
+            # 通过 torch.norm(..., dim=-1) 计算其 L2范数 ∣∣h∣∣2​，得到形状为 (bs, T) 的 heading_vec_norm。
+            # 随后使用 F.l1_loss 将 heading_vec_norm 与同形状的全 1 张量做 L1 损失，
+            # 等价于最小化 Lyaw=mean(∣ ∣∣h∣∣2−1 ∣)Lyaw​=mean(∣∣∣h∣∣2​−1∣) 
+            # 从而鼓励网络输出的余弦-正弦对位于单位圆 S1S1 上。最后将该正则项加到 reg_loss 中，作为总体规划回归损失的补充。
             heading_vec_norm = torch.norm(best_trajectory[..., 2:4], dim=-1)
             yaw_regularization_loss = F.l1_loss(
                 heading_vec_norm, heading_vec_norm.new_ones(heading_vec_norm.shape)

@@ -290,7 +290,8 @@ class PointsEncoder(nn.Module):
 
         x_features_valid = self.second_mlp(x_features[mask])
         res = torch.zeros(bs, n, self.encoder_channel, device=device)
+        # 接着，只对有效点取出拼接后的特征执行 second_mlp，输出 K×C，并按 mask 写回到 res（B×M×C）。
         res[mask] = x_features_valid
-
+        # 最后在点维上做一次全局最大池化，得到每个样本的全局嵌入向量（B×C），作为返回值。
         res = res.max(dim=1)[0]
         return res
